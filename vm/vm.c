@@ -2,7 +2,9 @@
 
 #include "threads/malloc.h"
 #include "vm/vm.h"
+#include "vm/file.h"
 #include "vm/inspect.h"
+#include "userprog/process.h"
 #include "kernel/hash.h"
 
 #include "threads/vaddr.h"
@@ -372,9 +374,57 @@ supplemental_page_table_init (struct supplemental_page_table *spt ) { //SPT 해�
 	hash_init(&spt->main_table, page_hash, page_less, NULL);
 }
 
-/* Copy supplemental page table from src to dst */
+bool supplemental_page_table_copy(struct supplemental_page_table *dst,
+									struct supplemental_page_table *src) {
+    if (hash_empty(&src->main_table)) return true;
+
+    struct hash_iterator i;
+    hash_first(&i, &src->main_table);
+    while (hash_next(&i)) {
+        struct page *srcPage = hash_entry(hash_cur(&i), struct page, page_hashelem);
+        enum vm_type type = page_get_type(srcPage);
+        void *upage = srcPage->va;
+        bool writable = srcPage->writable;
+
+        if (type == VM_UNINIT) {
+            // 만약 uninit도 복사하고 싶다면 아래와 같이 할 수 있음.
+            // vm_initializer *init = srcPage->uninit.init;
+            // void *aux = srcPage->uninit.aux;
+            // vm_alloc_page_with_initializer(...);
+        } 
+        else if (type == VM_ANON) {
+            // 익명 페이지 복사 (heap/stack 등)
+            if (!vm_alloc_page(type, upage, writable)) return false;
+            if (!vm_claim_page(upage)) return false;
+            struct page *newPage = spt_find_page(dst, upage);
+            if (srcPage->frame != NULL)
+                memcpy(newPage->frame->kva, srcPage->frame->kva, PGSIZE);
+        }
+        else if (type == VM_FILE) {
+            // 중요! file-backed page 복사 시 file_reopen 사용!
+            struct file_page *src_fp = &srcPage->file;
+
+            struct file_lazy_aux *aux = malloc(sizeof(struct file_lazy_aux));
+            aux->file       = file_reopen(src_fp->file); // 반드시 reopen!
+            aux->ofs        = src_fp->ofs;
+            aux->read_bytes = src_fp->read_bytes;
+            aux->zero_bytes = src_fp->zero_bytes;
+            aux->writable   = src_fp->writable;
+			aux->mmap_f = src_fp->mmap_f;
+
+            if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
+                                                lazy_load_segment, aux))
+                return false;
+            // 참고: *frame 복사 필요 없음. file-backed는 lazy-load로 충분.
+        }
+        // extra 과제 수행하려면 추가
+    }
+    return true;
+}
+
+
 bool
-supplemental_page_table_copy (struct supplemental_page_table *dst,
+supplemental_page_table_copy_orig (struct supplemental_page_table *dst,
 		struct supplemental_page_table *src ) {
 	
 	if(hash_empty(&src->main_table)) return true; // 복사할게 없네용 : true 반환
@@ -408,8 +458,137 @@ supplemental_page_table_copy (struct supplemental_page_table *dst,
 }
 
 /* Free the resource hold by the supplemental page table */
+/* Destroys all pages in the supplemental page table. */
+void supplemental_page_table_kill (struct supplemental_page_table *spt) {
+	if (spt == NULL) return;
+
+	struct hash_iterator i;
+	hash_first(&i, &spt->main_table);
+	while (hash_next(&i)) {
+		struct page *page = hash_entry(hash_cur(&i), struct page, page_hashelem);
+		ASSERT(page != NULL);
+
+		// 페이지 타입에 맞게 destroy 호출
+		if (page->operations){
+			destroy(page);
+		}
+		// uninit 페이지는 aux를 직접 해제해야 함
+		if (page_get_type(page) == VM_UNINIT && page->uninit.aux)
+			free(page->uninit.aux);
+
+		free(page);
+	}
+	hash_clear(&spt->main_table, NULL);
+}
+
 void
-supplemental_page_table_kill (struct supplemental_page_table *spt) {
+supplemental_page_table_kill_orig (struct supplemental_page_table *spt) {
 	hash_clear(&spt->main_table, NULL);
 	// temp. 좀더 정성껏 작성 할 것. 특히 파일 있는경우
 }
+
+
+
+// /* Copy supplemental page table from src to dst */
+// /* Return false on the first allocation error – callers usually kill the child. */
+// bool supplemental_page_table_copy (struct supplemental_page_table *dst,
+//                               		struct supplemental_page_table *src) {
+//     struct hash_iterator it;
+//     hash_first (&it, &src->main_table);
+
+//     /* On failure we clean up everything we have inserted so far. */
+//     while (hash_next (&it))
+//     {
+//         struct page *src_pg = hash_entry (hash_cur (&it), struct page,
+//                                           page_hashelem);
+
+//         enum vm_type type   = page_get_type (src_pg);
+//         void        *upage  = src_pg->va;
+//         bool         wr     = src_pg->writable;
+
+//         switch (VM_TYPE(type))
+//         {
+//             /* ---------- 1.  VM_UNINIT : replicate lazily ----------- */
+//             case VM_UNINIT:
+//             {
+//                 struct uninit_page *u = &src_pg->uninit;
+
+//                 /* Deep-copy aux if necessary (may be NULL). */
+//                 void *aux_copy = NULL;
+//                 if (u->aux != NULL)
+//                 {
+//                     aux_copy = malloc (u->aux_size);
+//                     if (aux_copy == NULL) goto fail;
+//                     memcpy (aux_copy, u->aux, u->aux_size);
+//                 }
+
+//                 if (!vm_alloc_page_with_initializer (u->type, upage, wr,
+//                                                      u->init, aux_copy))
+//                     goto fail;
+//                 break;
+//             }
+
+//             /* ---------- 2.  VM_ANON : eager copy ------------------- */
+//             case VM_ANON:
+//             {
+//                 /* Create a blank anon page then claim & copy contents. */
+//                 if (!vm_alloc_page (type, upage, wr)      ) goto fail;
+//                 if (!vm_claim_page (upage)                ) goto fail;
+
+//                 struct page *dst_pg = spt_find_page (dst, upage);
+//                 if (src_pg->frame != NULL && dst_pg->frame != NULL)
+//                     memcpy (dst_pg->frame->kva,
+//                             src_pg->frame->kva,
+//                             PGSIZE);
+//                 break;
+//             }
+
+//             /* ---------- 3.  VM_FILE : share contents, new file* ---- */
+//             case VM_FILE:
+//             {
+//                 /* Duplicate file handle */
+//                 struct file *child_file = file_reopen (src_pg->file.file);
+//                 if (child_file == NULL) goto fail;
+
+//                 /* Build a fresh aux for the child */
+//                 struct file_lazy_aux *aux = malloc (sizeof *aux);
+//                 if (aux == NULL) { file_close (child_file); goto fail; }
+
+//                 aux->file       = child_file;
+//                 aux->ofs        = src_pg->file.ofs;
+//                 aux->read_bytes = src_pg->file.read_bytes;
+//                 aux->zero_bytes = src_pg->file.zero_bytes;
+//                 aux->writable   = wr;
+
+//                 if (!vm_alloc_page_with_initializer (VM_FILE, upage, wr,
+//                                                      lazy_load_segment, aux))
+//                 {
+//                     file_close (child_file);
+//                     free (aux);
+//                     goto fail;
+//                 }
+//                 /* If page already loaded in parent, load it eagerly in child. */
+//                 if (src_pg->frame != NULL)
+//                     vm_claim_page (upage);   /* claim will cause lazy loader */
+//                 break;
+//             }
+
+//             default:
+//                 /* Unknown type – treat as fatal. */
+//                 goto fail;
+//         }
+//     }
+//     return true;
+
+// /* ------------- rollback on error ----------------- */
+// fail:
+//     /* Walk dst SPT and destroy every page we created so far. */
+//     hash_first (&it, &dst->main_table);
+//     while (hash_next (&it))
+//     {
+//         struct page *p = hash_entry (hash_cur (&it), struct page, page_hashelem);
+//         vm_dealloc_page (p);
+//     }
+//     hash_clear (&dst->main_table, NULL);
+//     return false;
+// }

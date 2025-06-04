@@ -32,6 +32,10 @@ static void __do_fork (void *);
 static void process_init (void) {
 	struct thread *curr = thread_current ();
 
+	// Project 3. ~
+    list_init(&curr->mmap_list);
+	curr->next_mmap_id = 1;
+	// ~ Project 3.
 }
 
 // 파일 객체에 대한 파일 디스크립터를 생성, 프로세스에 추가, 해당 fd 리턴
@@ -403,6 +407,16 @@ process_exit (void) {
 	}
 	palloc_free_multiple(curr->fd_table, FDT_PAGES);
 	file_close(curr->running); // 현재 실행 중인 파일도 닫는다. load()에 있었던 걸 여기로 옮김.
+	
+    // mmap 해제
+    struct list_elem *e = list_begin(&curr->mmap_list), *next;
+    while (e != list_end(&curr->mmap_list)) {
+        next = list_next(e);
+        struct mmap_file *mf = list_entry(e, struct mmap_file, elem);
+        do_munmap(mf->addr);
+        e = next;
+    }
+
 	process_cleanup ();
 	
 	sema_up(&curr->wait_sema); // 대기 중이던 부모를 깨우기
@@ -770,47 +784,49 @@ install_page (void *upage, void *kpage, bool writable) {
 /* From here, codes will be used after project 3.
  * If you want to implement the function for only project 2, implement it on the
  * upper block. */
-
 bool lazy_load_segment (struct page *page, void *aux) {
-	/* TODO: Load the segment from the file */
-	/* TODO: This called when the first page fault occurs on address VA. */
-	/* TODO: VA is available when calling this function. */
-	ASSERT(page != NULL);
-	struct file_page *fla = (struct file_page *) aux;
-	ASSERT(fla != NULL);
+    ASSERT(page != NULL);
+    struct file_lazy_aux *fla = (struct file_lazy_aux *) aux;
+    ASSERT(fla != NULL);
 
-	// page->frame는 이미 할당되어 있음
-	uint8_t *kva = page->frame->kva;
-	page->writable = fla->writable; // 쓰기 보호
-    // file_read_at을 사용!
+    uint8_t *kva = page->frame->kva;
 
-    // 파일 seek은 thread-safe하지 않으므로 file_read_at을 사용!
-	// TODO: 오작동 시 걍 seek 쓸 것.
-    struct file *fl_file = fla->file;
-    off_t fl_offset = fla->ofs;
-    size_t fl_read_bytes = fla->read_bytes;
-    size_t fl_zero_bytes = fla->zero_bytes;
-	bool fl_writable = fla->writable;
-    size_t file_len = file_length(fl_file);
+    // 권한 기록
+    page->writable = fla->writable;
 
-    // 실제로 읽을 수 있는 양 계산
-    size_t available = 0;
-    if (fl_offset < file_len) {
-        available = file_len - fl_offset;
-        if (available > fl_read_bytes)
-            available = fl_read_bytes;
+    // file-backed 정보 page->file_page에 기록 (VM_FILE 타입만)
+    if (page_get_type(page) == VM_FILE) {
+        page->file.file = fla->file;
+        page->file.ofs = fla->ofs;
+        page->file.read_bytes = fla->read_bytes;
+        page->file.zero_bytes = fla->zero_bytes;
+        page->file.mmap_f = fla->mmap_f;
+		// page->file.ref_count = fla->ref_count;
     }
-    // 파일에서 read_bytes만큼 읽기
-    off_t actually = file_read_at(fl_file, kva, fl_read_bytes, fl_offset);
-    if (actually != available)
-    {
+
+    // 실제 파일로부터 읽기
+    size_t file_len = file_length(fla->file);
+    size_t available = 0;
+    if (fla->ofs < file_len) {
+        available = file_len - fla->ofs;
+        if (available > fla->read_bytes)
+            available = fla->read_bytes;
+    }
+
+    off_t actually = file_read_at(fla->file, kva, available, fla->ofs);
+
+    if (actually != available) {
+        free(fla); // malloc 해제
         return false;
     }
-	// 나머지는 zero fill
-	memset(kva + fla->read_bytes, 0, fla->zero_bytes);
 
-	return true;
+    // zero fill
+    memset(kva + available, 0, PGSIZE - available);
+
+    free(fla);
+    return true;
 }
+
 
 /* Loads a segment starting at offset OFS in FILE at address
  * UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual

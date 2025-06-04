@@ -13,7 +13,8 @@ struct file_page {
 	size_t read_bytes;
 	size_t zero_bytes;
     bool writable; // for permission bit in page table
-	int *ref_count;
+	// int ref_count;
+	struct mmap_file* mmap_f;
 };
 
 void vm_file_init (void);

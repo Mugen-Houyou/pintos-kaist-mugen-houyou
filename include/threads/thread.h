@@ -111,6 +111,8 @@ struct thread {
 	/* Table for whole virtual memory owned by thread. */
 	struct supplemental_page_table spt;
 	void *rsp; // 현재 액세스가 user인지 kernel인지 확인
+	struct list mmap_list;
+	int next_mmap_id;
 #endif
 
 	/* Owned by thread.c. */
